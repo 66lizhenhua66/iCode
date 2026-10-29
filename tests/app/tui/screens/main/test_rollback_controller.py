@@ -39,7 +39,6 @@ from tests.support.tui_helpers import (
     main_screen_parts,
     main_screen_state_at,
     make_session_handler,
-    stale_file_cache,
 )
 
 
@@ -1292,7 +1291,7 @@ def test_welcome_rollback_keeps_logo_metadata_and_suppresses_chdir_marker() -> N
             max_context_tokens=180_000,
             total_session_tokens=64_000,
         ),
-        _suggestions=SimpleNamespace(file_cache=stale_file_cache("stale.py")),
+        _suggestions=SimpleNamespace(discard_file_index=lambda: None),
         query_one=query_one,
         _update_toc=lambda: calls.append(("toc", None)),
         _session_title=fake_session_title(
