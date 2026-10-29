@@ -20,10 +20,13 @@ from chrys.app.tui.widgets.chrome.file_scanner import (
     ProjectPathScanResult,
     ProjectPathSuggestion,
     _append_unseen_dot_entries_from_walk,
+    _ChunkedLineReader,
     _is_referenceable_walk_name,
+    _probe_ignored_visible_files,
     _project_path_suggestions,
     _scan_dot_entries,
     _scan_os_walk_files,
+    _select_ignored_visible_files,
     _top_level_dot_entries,
     _walk_relative_path,
     fuzzy_filter,
@@ -830,6 +833,22 @@ class TestScanDotEntries:
 
 
 class TestParallelProbeScheduling:
+    def test_rejected_rows_after_the_last_kept_path_still_truncate(self, repo: Path) -> None:
+        """A budget cut at the final kept path must still report the rows git printed after it."""
+        (repo / ".gitignore").write_text("gen/\n")
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "-q", "-m", "ignore gen")
+        (repo / "gen").mkdir()
+        (repo / "gen" / "a.md").write_text("x\n")
+        (repo / "gen" / "b.zip").write_bytes(b"PK\x03\x04")
+
+        probe = asyncio.run(_probe_ignored_visible_files(str(repo)))
+
+        assert probe.paths == ["gen/a.md"]
+        assert probe.lines_after_last == 1
+        assert _select_ignored_visible_files(probe, 1).truncated is True
+        assert _select_ignored_visible_files(probe, 2).truncated is False
+
     @pytest.mark.asyncio
     async def test_every_probe_starts_before_any_result_is_awaited(
         self,
@@ -1003,3 +1022,54 @@ class TestDerivedDirectoryReuse:
 
         assert [entry.path for entry in result.suggestions] == ["a/", "a/one.py", "a/two.py"]
         assert result.truncated is True
+
+
+class _FakeStdout:
+    """Minimal ``asyncio.StreamReader`` stand-in that answers ``read`` in fixed blocks."""
+
+    def __init__(self, payload: bytes, block: int) -> None:
+        self._payload = payload
+        self._offset = 0
+        self._block = block
+
+    async def read(self, n: int = -1) -> bytes:
+        size = self._block if n < 0 else min(n, self._block)
+        chunk = self._payload[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+
+def _read_lines(payload: bytes, block: int) -> list[bytes]:
+    async def collect() -> list[bytes]:
+        reader = _ChunkedLineReader(_FakeStdout(payload, block), chunk_size=8)
+        lines: list[bytes] = []
+        while line := await reader.line():
+            lines.append(line)
+        return lines
+
+    return asyncio.run(collect())
+
+
+class TestChunkedLineReader:
+    """The block reader must hand back exactly the lines ``StreamReader.readline`` returns."""
+
+    @pytest.mark.parametrize("block", [1, 2, 3, 4, 5, 7, 8, 64, 4096])
+    def test_matches_readline_across_block_boundaries(self, block: int) -> None:
+        payload = b"a.py\nsrc/b.py\r\nlonger/name/here.py\n"
+
+        assert _read_lines(payload, block) == [b"a.py\n", b"src/b.py\r\n", b"longer/name/here.py\n"]
+
+    def test_trailing_fragment_at_eof_is_a_line(self) -> None:
+        """Output without a final newline still yields its last path."""
+        assert _read_lines(b"a.py\nb.py", 3) == [b"a.py\n", b"b.py"]
+
+    def test_empty_stream_returns_no_lines(self) -> None:
+        assert _read_lines(b"", 4) == []
+
+    def test_blank_line_is_preserved(self) -> None:
+        assert _read_lines(b"a\n\nb\n", 2) == [b"a\n", b"\n", b"b\n"]
+
+    def test_line_ending_exactly_on_chunk_boundary(self) -> None:
+        payload = b"12345678\nnext\n"
+
+        assert _read_lines(payload, 9) == [b"12345678\n", b"next\n"]
