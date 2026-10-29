@@ -41,6 +41,9 @@ from chrys.service.mutations.types import MutationProvenance, MutationSource
 from chrys.service.profiles.models.schema import is_model_profile_selectable
 
 _FILE_QUERY_DEBOUNCE_SECONDS = 0.016
+# How many scans one background rebuild may chain before leaving the rest of the
+# change set dirty for the next lifecycle event.
+_FILE_INDEX_REBUILD_SCANS = 3
 _FILE_QUERY_LIMIT = 30
 # The list shows the best this many prompts; search covers every stored prompt.
 _PROMPT_HISTORY_DISPLAY_LIMIT = 100
@@ -838,6 +841,22 @@ class SuggestionHandler:
         if index.dirty:
             self._schedule_file_index_rebuild(index)
 
+    def invalidate_file_index(self) -> None:
+        """Force a rescan after a rollback restored files behind the tracker's back.
+
+        A rollback deletes the rolled-back periods from the mutation tracker, so
+        the restored paths never reach :meth:`mark_file_index_dirty`, and a
+        snapshot folded clean since then would keep listing a file the user just
+        undid.  ``discard()`` would blank the popup until a cold build finishes,
+        so the snapshot is marked dirty with an unknown change set instead: it
+        keeps answering, and the rebuild hot-swaps the restored truth.
+        """
+        index = self._file_index
+        if index is None or not index.installed:
+            return
+        index.mark_dirty()
+        self._schedule_file_index_rebuild(index)
+
     def discard_file_index(self) -> None:
         """Drop the snapshot before another workspace or session takes over."""
         index = self._file_index
@@ -879,11 +898,24 @@ class SuggestionHandler:
         )
 
     async def _run_file_index_rebuild(self, index: WorkspacePathIndex) -> None:
-        if not await index.refresh():
-            return
-        if self._file_index is not index or self._suggestion_mode != "files":
-            return
-        self._show_latest_file_query_or_head()
+        """Rebuild until the snapshot is provably current, within a bounded number of scans.
+
+        A change that landed mid-scan leaves the installed snapshot dirty: an
+        enumerable one folds in memory right here, an unknowable one forces one
+        more scan.  The cap keeps a workspace that changes faster than it can be
+        scanned from re-scanning forever; whatever is still pending stays dirty
+        for the next lifecycle event.
+        """
+        for _attempt in range(_FILE_INDEX_REBUILD_SCANS):
+            if not await index.refresh():
+                return
+            if self._file_index is not index:
+                return
+            settled = index.apply_changes()
+            if self._suggestion_mode == "files":
+                self._show_latest_file_query_or_head()
+            if settled or not index.dirty:
+                return
 
     async def _run_file_warmup_loop(self) -> None:
         """Coalesced cold build; a root that already has a snapshot never lands here."""

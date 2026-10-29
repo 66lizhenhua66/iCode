@@ -996,3 +996,114 @@ async def test_a_turn_end_that_lands_during_a_rebuild_still_reaches_the_next_at(
     assert scans == scans_after_rebuild == [root]
     assert handler._file_index.dirty is False
     assert "src/created.py" in _file_rows(handler)
+
+
+async def test_a_rollback_invalidation_drops_the_path_the_undo_restored_away(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """``/undo`` deletes the file a turn created; a fold-clean snapshot must stop listing it.
+
+    The rolled-back periods are gone from the tracker, so the restored paths
+    never reach ``mark_file_index_dirty``: only the rollback invalidating the
+    snapshot gets the ``@`` rows back to the restored truth.
+    """
+    root = str(tmp_path)
+    generated = tmp_path / "generated.py"
+    generated.write_text("", encoding="utf-8")
+    screen = _screen_at(root)
+    handler = make_suggestion_handler(screen)
+    scans: list[str] = []
+
+    async def restored_scan(scan_root: str) -> ProjectPathScanResult:
+        return scan_result(scan_root, [])
+
+    _patch_scan(monkeypatch, restored_scan, roots=scans)
+    _install_file_rows(handler, root, [ProjectPathSuggestion(path="generated.py", kind="file")])
+    screen.services.engine_provider = _engine
+
+    handler.mark_file_index_dirty()
+    assert handler._file_index is not None
+    assert handler._file_index.dirty is False
+    assert _file_rows(handler) == ["generated.py"]
+
+    generated.unlink()
+    handler.invalidate_file_index()
+    assert handler._file_rebuild_worker is not None
+    await handler._file_rebuild_worker.wait()
+
+    assert scans == [root]
+    assert _file_rows(handler) == []
+
+    # A later turn that changed nothing must not resurrect the rolled-back path.
+    handler.mark_file_index_dirty()
+
+    assert handler._file_index.dirty is False
+    assert _file_rows(handler) == []
+    assert scans == [root]
+
+
+async def test_a_rebuild_that_installs_an_unknowable_change_scans_again(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """P3-3: a scan that straddled an unknowable change cannot be the last one."""
+    root = str(tmp_path)
+    screen = _screen_at(root)
+    handler = make_suggestion_handler(screen)
+    scans: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_scan(scan_root: str) -> ProjectPathScanResult:
+        scans.append(scan_root)
+        if len(scans) == 1:
+            started.set()
+            await release.wait()
+            return scan_result(scan_root, [ProjectPathSuggestion(path="stale.py", kind="file")])
+        return scan_result(scan_root, [ProjectPathSuggestion(path="fresh.py", kind="file")])
+
+    _patch_scan(monkeypatch, gated_scan)
+    _install_file_rows(handler, root, [ProjectPathSuggestion(path="stale.py", kind="file")])
+    screen.services.engine_provider = _no_engine
+
+    # Turn 1 starts the rebuild; turn 2 changes something unknowable mid-scan.
+    handler.mark_file_index_dirty()
+    await started.wait()
+    handler.mark_file_index_dirty()
+    release.set()
+    await handler._file_rebuild_worker.wait()
+
+    assert scans == [root, root]
+    assert handler._file_index is not None
+    assert handler._file_index.dirty is False
+    assert _file_rows(handler) == ["fresh.py"]
+
+
+async def test_a_rebuild_chains_a_bounded_number_of_scans(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A workspace that never stops changing must not re-scan forever."""
+    root = str(tmp_path)
+    screen = _screen_at(root)
+    handler = make_suggestion_handler(screen)
+    scans: list[str] = []
+
+    async def always_changing_scan(scan_root: str) -> ProjectPathScanResult:
+        scans.append(scan_root)
+        index = handler._file_index
+        if index is not None:
+            index.mark_dirty()
+        return scan_result(scan_root, [ProjectPathSuggestion(path="busy.py", kind="file")])
+
+    _patch_scan(monkeypatch, always_changing_scan)
+    _install_file_rows(handler, root, [ProjectPathSuggestion(path="before.py", kind="file")])
+    screen.services.engine_provider = _no_engine
+
+    handler.mark_file_index_dirty()
+    await handler._file_rebuild_worker.wait()
+
+    assert len(scans) == suggestions_module._FILE_INDEX_REBUILD_SCANS
+    assert handler._file_index is not None
+    assert handler._file_index.dirty is True

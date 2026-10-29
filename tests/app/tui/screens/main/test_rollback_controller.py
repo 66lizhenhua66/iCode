@@ -85,6 +85,7 @@ def _make_rollback_controller(
     set_has_messages: Callable[[bool], None] = lambda _value: None,
     post_gc_message: Callable[[GcReclaimRequested], object] = lambda _message: None,
     debug: Callable[[str, str], None] = lambda *_args: None,
+    invalidate_file_index: Callable[[], None] = lambda: None,
     confirm_stopping_background_tasks: Callable[[int], Awaitable[bool]] | None = None,
 ) -> RollbackController:
     """Build a RollbackController whose collaborators are inert unless overridden."""
@@ -101,6 +102,7 @@ def _make_rollback_controller(
         set_has_messages=set_has_messages,
         post_gc_message=post_gc_message,
         debug=debug,
+        invalidate_file_index=invalidate_file_index,
         confirm_stopping_background_tasks=confirm_stopping_background_tasks,
     )
 
@@ -135,6 +137,7 @@ def _make_rollback_controller_for_test(screen: SimpleNamespace) -> RollbackContr
         set_has_messages=setters.set_has_messages,
         post_gc_message=_post_gc_message,
         debug=screen._debug,
+        invalidate_file_index=lambda: None,
     )
 
 
@@ -1066,6 +1069,40 @@ def test_rollback_result_restores_rolled_back_user_text() -> None:
 
     assert restored == ["second prompt"]
     assert notifications[-1][1].get("severity") == "information"
+
+
+def test_a_rollback_result_invalidates_the_resident_file_index() -> None:
+    """The engine only publishes the result; the ``@`` snapshot learns of the restore here."""
+
+    class _RollbackView:
+        def notify(
+            self,
+            message: str,
+            *,
+            title: str,
+            severity: str = "information",
+            timeout: float | None = 3,
+        ) -> None:
+            pass
+
+        def open_rollback_modal(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("unexpected modal")
+
+        async def restore_welcome_rollback(self, *, session_id: str | None, profile: str, cwd: str) -> None:
+            raise AssertionError("unexpected welcome restore")
+
+        def restore_input_text(self, text: str) -> None:
+            return None
+
+    invalidations: list[str] = []
+    controller = _make_rollback_controller(
+        view=_RollbackView(),
+        invalidate_file_index=lambda: invalidations.append("invalidated"),
+    )
+
+    asyncio.run(controller.on_result(RollbackResult(session_id="session-1", target_turn=1)))
+
+    assert invalidations == ["invalidated"]
 
 
 def test_welcome_rollback_restores_input_after_welcome_state() -> None:

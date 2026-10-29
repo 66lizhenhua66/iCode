@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import sys
 from bisect import bisect_left
 from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING
@@ -101,6 +102,20 @@ def _ancestor_directories(relative_path: str) -> list[str]:
     return ["/".join(parts[:index]) + "/" for index in range(1, len(parts))]
 
 
+def _path_identity(relative_path: str) -> str:
+    """Return the key a root-relative path is deduplicated by.
+
+    Windows treats ``src/app.py`` and ``src/App.py`` as one file, so the visible
+    set must too; darwin's default volume is case-insensitive as well.  The
+    spelling a row is displayed with stays in the row itself, so folding never
+    rewrites how a path is shown.
+    """
+    identity = os.path.normcase(relative_path)
+    if sys.platform == "darwin":
+        identity = identity.casefold()
+    return identity
+
+
 def _directory_reference_counts(files: Iterable[str]) -> dict[str, int]:
     """Count the files under each directory, so a directory row lives iff its count is positive."""
     counts: dict[str, int] = {}
@@ -130,7 +145,7 @@ class WorkspacePathIndex:
         self.build_task: asyncio.Task[bool] | None = None
         self.delta: set[str] = set()
         self._files: list[str] = []
-        self._file_set: set[str] = set()
+        self._identities: dict[str, str] = {}
         self._directory_counts: dict[str, int] = {}
         self._source_truncations: dict[str, bool] = {}
         self._file_budget = 0
@@ -139,6 +154,10 @@ class WorkspacePathIndex:
         # Bumped on every recorded change, so a rebuild that straddled one knows
         # its scan predates the change and leaves the snapshot dirty.
         self._change_seq = 0
+        # Bumped on every change set we could not enumerate, so a rebuild that
+        # was already running when one landed knows its scan does not cover it —
+        # a boolean cannot tell "covered by this scan" from "arrived after it".
+        self._unknown_seq = 0
         # A change set we could not enumerate (shell tools, truncated detection)
         # rules out folding known paths in: only a rescan can cover it.
         self._unknown_changes = False
@@ -176,6 +195,7 @@ class WorkspacePathIndex:
         if changed is None:
             self.dirty = True
             self._change_seq += 1
+            self._unknown_seq += 1
             self._unknown_changes = True
             self.delta.clear()
             return
@@ -211,16 +231,17 @@ class WorkspacePathIndex:
             relative = self._relative_path(path)
             if relative is None:
                 continue
+            identity = _path_identity(relative)
             if os.path.isdir(path):
                 return False
             if os.path.exists(path):
-                if relative in self._file_set:
+                if identity in self._identities:
                     continue
                 if not self._addition_is_visible(relative):
                     return False
                 additions.append(relative)
-            elif relative in self._file_set:
-                removals.append(relative)
+            elif identity in self._identities:
+                removals.append(identity)
 
         if self._file_budget > 0 and len(self._files) + len(additions) > self._file_budget:
             # The scan caps file discovery; adding past it belongs to a rescan.
@@ -235,8 +256,8 @@ class WorkspacePathIndex:
             self.delta.clear()
             return True
 
-        for relative in removals:
-            self._remove_file(relative)
+        for identity in removals:
+            self._remove_file(identity)
         for relative in additions:
             self._add_file(relative)
         self._reinstall_rows()
@@ -250,7 +271,7 @@ class WorkspacePathIndex:
         self.delta.clear()
         self._unknown_changes = False
         self._files = []
-        self._file_set = set()
+        self._identities = {}
         self._directory_counts = {}
         self._source_truncations = {}
         self._file_budget = 0
@@ -278,9 +299,12 @@ class WorkspacePathIndex:
         epoch = self.epoch
         change_seq = self._change_seq
         # Everything recorded before the scan starts is in its result; only what
-        # arrives while it runs has to survive the install.
+        # arrives while it runs has to survive the install.  Unknown change sets
+        # need their own sequence: a flag cannot tell "already covered by this
+        # scan" from "landed after it started", and folding an enumerable delta
+        # over a snapshot no scan covered would report a stale index current.
         covered_delta = set(self.delta)
-        covered_unknown = self._unknown_changes
+        covered_unknown_seq = self._unknown_seq
         try:
             result = await scan(self.root)
             index = await asyncio.to_thread(ProjectPathIndex.build, result)
@@ -293,7 +317,7 @@ class WorkspacePathIndex:
         if self.epoch != epoch:
             return False
         arrived_delta = set(self.delta) - covered_delta
-        arrived_unknown = self._unknown_changes and not covered_unknown
+        arrived_unknown = self._unknown_seq != covered_unknown_seq
         self._install(result, index)
         if self._change_seq != change_seq:
             # The scan may predate these changes, so the snapshot is not their
@@ -307,7 +331,7 @@ class WorkspacePathIndex:
         self.snapshot = index
         self.epoch += 1
         self._files = [suggestion.path for suggestion in scan.paths if suggestion.kind == "file"]
-        self._file_set = set(self._files)
+        self._identities = {_path_identity(relative_path): relative_path for relative_path in self._files}
         self._directory_counts = _directory_reference_counts(self._files)
         self._source_truncations = dict(scan.source_truncations)
         self._file_budget = scan.file_budget
@@ -365,14 +389,16 @@ class WorkspacePathIndex:
         set, and the budget constants.  Do not turn this into a sorted insert.
         """
         self._files.append(relative_path)
-        self._file_set.add(relative_path)
+        self._identities[_path_identity(relative_path)] = relative_path
         for directory in _ancestor_directories(relative_path):
             self._directory_counts[directory] = self._directory_counts.get(directory, 0) + 1
 
-    def _remove_file(self, relative_path: str) -> None:
+    def _remove_file(self, identity: str) -> None:
+        relative_path = self._identities.pop(identity, None)
+        if relative_path is None:
+            return
         with contextlib.suppress(ValueError):
             self._files.remove(relative_path)
-        self._file_set.discard(relative_path)
         for directory in _ancestor_directories(relative_path):
             remaining = self._directory_counts.get(directory, 0) - 1
             if remaining > 0:

@@ -721,6 +721,9 @@ class MainScreen(RightClickScreenCopyMixin, Screen):
         if restoring:
             self._session_title.clear_terminal_title_result()
 
+    def _invalidate_suggestion_file_index(self) -> None:
+        self._suggestions.invalidate_file_index()
+
     def _discard_suggestion_file_index(self) -> None:
         self._suggestions.discard_file_index()
 
@@ -852,6 +855,7 @@ class MainScreen(RightClickScreenCopyMixin, Screen):
             set_has_messages=self._set_has_messages,
             post_gc_message=self.post_message,
             debug=self._debug,
+            invalidate_file_index=self._invalidate_suggestion_file_index,
             locale_controller=self._locale_controller,
             confirm_stopping_background_tasks=lambda turn: self._confirm_stopping_background_tasks(after_turn=turn),
         )

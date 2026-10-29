@@ -325,6 +325,50 @@ class TestWorkspacePathIndexLifecycle:
         assert index.dirty is False
         assert "b.py" in _paths(index.query("", limit=10))
 
+    async def test_an_unknown_change_that_lands_mid_rebuild_is_not_washed_clean_by_a_fold(
+        self,
+        tmp_path,
+    ) -> None:
+        """An unknowable change during a scan is not in that scan, so a later fold cannot clear it.
+
+        ``_install`` dropped the pending unknown set whenever one was already
+        pending when the scan started, so the next enumerable turn end folded a
+        path over a snapshot no scan had covered and reported it current.
+        """
+        root = str(tmp_path)
+        old = tmp_path / "old.py"
+        old.write_text("", encoding="utf-8")
+        new = tmp_path / "new.py"
+        new.write_text("", encoding="utf-8")
+        index = WorkspacePathIndex(root)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_scan(scan_root: str) -> ProjectPathScanResult:
+            started.set()
+            await release.wait()
+            return _scan(scan_root, ["old.py"])
+
+        index.mark_dirty()  # turn 1: change set unknowable, so a rescan starts
+        rebuild = asyncio.ensure_future(index.refresh(slow_scan))
+        await started.wait()
+        old.unlink()
+        index.mark_dirty()  # turn 2: another unknowable change, after the scan began
+        release.set()
+
+        assert await rebuild is True
+        assert index.dirty is True
+        # The enumerable delta must not be folded over a scan that never covered turn 2.
+        assert index.apply_changes([str(new)]) is False
+        assert index.dirty is True
+
+        async def rescan(scan_root: str) -> ProjectPathScanResult:
+            return _scan(scan_root, ["new.py"])
+
+        assert await index.refresh(rescan) is True
+        assert index.dirty is False
+        assert _paths(index.head(limit=10)) == ["new.py"]
+
     def test_apply_changes_refuses_when_stale_with_nothing_pending(self, tmp_path) -> None:
         """A stale snapshot with no known delta can only be cleared by a rescan."""
         root = str(tmp_path)
@@ -564,3 +608,20 @@ class TestWorkspacePathIndexIncrementalApply:
         index.install(_scan(root, ["a.py"]))
 
         assert index.apply_changes([str(added)]) is True
+
+    @pytest.mark.skipif(os.name != "nt", reason="path identity is case-insensitive only on Windows")
+    def test_apply_changes_does_not_list_a_case_variant_of_a_known_file(self, tmp_path) -> None:
+        """Windows is case-insensitive: ``src/App.py`` is the row ``src/app.py``.
+
+        Folding by the literal relative path appended a second row for one file,
+        so a turn that touched it through a different spelling duplicated it.
+        """
+        (tmp_path / "src").mkdir()
+        known = tmp_path / "src" / "app.py"
+        known.write_text("", encoding="utf-8")
+        index = WorkspacePathIndex(str(tmp_path))
+        index.install(_scan(str(tmp_path), ["src/app.py"]))
+
+        assert index.apply_changes([str(tmp_path / "src" / "App.py")]) is True
+
+        assert _paths(index.head(limit=10)) == ["src/", "src/app.py"]
