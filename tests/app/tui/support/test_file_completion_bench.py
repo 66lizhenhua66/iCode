@@ -141,7 +141,7 @@ class TestArgumentHandling:
 class TestInstrumentedScanner:
     def test_wrapping_scanner_probes_is_reverted_afterwards(self) -> None:
         module = bench.file_scanner_module
-        wrapped_names = [*bench.PROBE_PHASES, *bench.SYNC_PHASES]
+        wrapped_names = [*bench._resolve_probe_sources().values(), *bench.SYNC_PHASES]
         originals = {name: getattr(module, name) for name in wrapped_names}
 
         with instrumented_scanner(Recorder()):

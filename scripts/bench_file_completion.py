@@ -53,12 +53,15 @@ QUERIES = ("", "e", "src/", "test_", "file_completion")
 # Repeated per round so the P95 of a fast query is still a measurement.
 QUERY_ITERATIONS = 10
 
-# ``file_scanner`` module attribute -> reported phase name.
-PROBE_PHASES = {
-    "_scan_rg_files": "rg_files",
-    "_append_git_cached_files": "git_cached",
-    "_append_dot_entries": "dot_entries",
-    "_scan_ignored_visible_files": "ignored_visible",
+# Reported phase name -> the ``file_scanner`` attributes that may implement it.
+# The serial scanner (``c54b60c``) appended each source, the parallel one splits
+# the ignored probe from its selection and reads the dot walk as a separate
+# step, so a phase is timed through whichever attribute the tree under test has.
+PHASE_SOURCES = {
+    "rg_files": ("_scan_rg_files",),
+    "git_cached": ("_append_git_cached_files", "_scan_git_ls_files"),
+    "dot_entries": ("_append_dot_entries", "_scan_dot_entries"),
+    "ignored_visible": ("_scan_ignored_visible_files", "_probe_ignored_visible_files"),
 }
 SYNC_PHASES = {"_project_path_suggestions": "derived_rows"}
 
@@ -137,11 +140,22 @@ def _timed_sync(recorder: Recorder, phase: str, target: Callable[..., Any]) -> C
     return timed
 
 
+def _resolve_probe_sources() -> dict[str, str]:
+    """Return ``phase -> attribute`` for the probes this tree actually ships."""
+    resolved: dict[str, str] = {}
+    for phase, candidates in PHASE_SOURCES.items():
+        for name in candidates:
+            if hasattr(file_scanner_module, name):
+                resolved[phase] = name
+                break
+    return resolved
+
+
 @contextmanager
 def instrumented_scanner(recorder: Recorder) -> Generator[None]:
     """Record per-probe timings while the shipped ``scan_project_paths`` runs."""
     replacements: dict[str, Callable[..., Any]] = {}
-    for name, phase in PROBE_PHASES.items():
+    for phase, name in _resolve_probe_sources().items():
         replacements[name] = _timed_async(recorder, phase, getattr(file_scanner_module, name))
     for name, phase in SYNC_PHASES.items():
         replacements[name] = _timed_sync(recorder, phase, getattr(file_scanner_module, name))
