@@ -861,7 +861,8 @@ async def test_a_turn_end_applies_tracker_deltas_without_a_rebuild(
     assert handler._file_rebuild_worker is None
     assert handler._file_index is not None
     assert handler._file_index.dirty is False
-    assert _file_rows(handler) == ["src/", "src/old.py", "src/new.py"]
+    # ADR-3a: a folded row is appended, so only the visible set is contractual here.
+    assert set(_file_rows(handler)) == {"src/", "src/old.py", "src/new.py"}
 
 
 @pytest.mark.parametrize(

@@ -369,6 +369,27 @@ class TestWorkspacePathIndexIncrementalApply:
         assert index.snapshot is not None
         assert index.snapshot.file_count == 1
 
+    def test_apply_changes_appends_an_addition_instead_of_inserting_it_in_path_order(
+        self,
+        tmp_path,
+    ) -> None:
+        """ADR-3a: folded rows are appended, so head order is not the scan order.
+
+        ``head()`` returns the last full-scan prefix plus the appended tail, not a
+        lexicographic prefix: ``src/aaa.py`` sorts ahead of ``src/zzz.py`` yet
+        lands after it, until the next full rebuild.
+        """
+        root = str(tmp_path)
+        (tmp_path / "src").mkdir()
+        added = tmp_path / "src" / "aaa.py"
+        added.write_text("", encoding="utf-8")
+        index = WorkspacePathIndex(root)
+        index.install(_scan(root, ["src/zzz.py"]))
+
+        assert index.apply_changes([str(added)]) is True
+
+        assert _paths(index.query("", limit=10)) == ["src/", "src/zzz.py", "src/aaa.py"]
+
     def test_apply_changes_drops_a_directory_row_with_its_last_file(self, tmp_path) -> None:
         root = str(tmp_path)
         nested = tmp_path / "src" / "deep"

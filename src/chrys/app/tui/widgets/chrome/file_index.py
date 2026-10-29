@@ -353,6 +353,17 @@ class WorkspacePathIndex:
         return rows
 
     def _add_file(self, relative_path: str) -> None:
+        """Append a folded file row; never inserted in path order.
+
+        ADR-3a: ``head()`` returns a prefix of the last full scan's order, not a
+        lexicographic prefix — ``rg --sort path`` is a per-directory depth-first
+        order and the supplemental sources append after the primary block.  A
+        folded row therefore goes to the tail of ``_files`` (its ancestor rows
+        stay next to it), so post-fold empty-query order is not guaranteed to
+        match a fresh full scan until the next full rebuild.  Frozen regardless:
+        the visible set, the match ordering key, the ``source_truncations`` key
+        set, and the budget constants.  Do not turn this into a sorted insert.
+        """
         self._files.append(relative_path)
         self._file_set.add(relative_path)
         for directory in _ancestor_directories(relative_path):
