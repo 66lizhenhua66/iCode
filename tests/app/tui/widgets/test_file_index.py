@@ -270,7 +270,13 @@ class TestWorkspacePathIndexLifecycle:
         assert await rebuild is False
         assert index.snapshot is None
 
-    async def test_change_recorded_while_rebuilding_leaves_the_snapshot_dirty(self) -> None:
+    async def test_change_recorded_while_rebuilding_survives_the_install(self) -> None:
+        """A change that lands mid-scan is not in the scan, so it stays pending.
+
+        Dropping it would install the scan as a clean baseline and the file would
+        never appear: the next ``apply_changes`` would fold nothing and report the
+        snapshot current.
+        """
         index = WorkspacePathIndex("/repo")
         started = asyncio.Event()
         release = asyncio.Event()
@@ -287,6 +293,57 @@ class TestWorkspacePathIndexLifecycle:
 
         assert await rebuild is True
         assert index.dirty is True
+        assert index.delta == {os.path.abspath("/repo/b.py")}
+
+    async def test_a_change_recorded_during_a_rebuild_is_folded_by_the_next_turn(
+        self,
+        tmp_path,
+    ) -> None:
+        root = str(tmp_path)
+        created = tmp_path / "b.py"
+        created.write_text("", encoding="utf-8")
+        index = WorkspacePathIndex(root)
+        index.install(_scan(root, ["a.py"]))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_scan(scan_root: str) -> ProjectPathScanResult:
+            started.set()
+            await release.wait()
+            return _scan(scan_root, ["a.py"])
+
+        rebuild = asyncio.ensure_future(index.refresh(slow_scan))
+        await started.wait()
+        assert index.apply_changes([str(created)]) is False
+        index.mark_dirty([str(created)])
+        release.set()
+        assert await rebuild is True
+
+        # A later turn that changed nothing still folds what was left pending.
+        assert index.apply_changes() is True
+
+        assert index.dirty is False
+        assert "b.py" in _paths(index.query("", limit=10))
+
+    def test_apply_changes_refuses_when_stale_with_nothing_pending(self, tmp_path) -> None:
+        """A stale snapshot with no known delta can only be cleared by a rescan."""
+        root = str(tmp_path)
+        index = WorkspacePathIndex(root)
+        index.install(_scan(root, ["a.py"]))
+        index.dirty = True
+
+        assert index.apply_changes() is False
+        assert index.dirty is True
+
+    def test_mark_dirty_with_no_changed_paths_records_nothing(self) -> None:
+        """An empty change set is the caller saying it observed no change."""
+        index = WorkspacePathIndex("/repo")
+        index.install(_scan("/repo", ["a.py"]))
+
+        index.mark_dirty([])
+
+        assert index.dirty is False
+        assert index.delta == set()
 
 
 class TestWorkspacePathIndexIncrementalApply:

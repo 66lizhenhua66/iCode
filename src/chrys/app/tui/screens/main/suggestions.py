@@ -835,7 +835,8 @@ class SuggestionHandler:
             # A turn that only read files (empty set) also lands here: nothing to rebuild.
             return
         index.mark_dirty(changed)
-        self._schedule_file_index_rebuild(index)
+        if index.dirty:
+            self._schedule_file_index_rebuild(index)
 
     def discard_file_index(self) -> None:
         """Drop the snapshot before another workspace or session takes over."""

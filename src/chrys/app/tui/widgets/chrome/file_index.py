@@ -171,14 +171,20 @@ class WorkspacePathIndex:
 
         ``changed`` is the set of absolute paths the change came from; pass
         ``None`` when the change set is unknown, which forces a full rebuild.
+        An empty set means the caller observed no change, so nothing is recorded.
         """
-        self.dirty = True
-        self._change_seq += 1
         if changed is None:
+            self.dirty = True
+            self._change_seq += 1
             self._unknown_changes = True
             self.delta.clear()
             return
-        self.delta.update(os.path.abspath(path) for path in changed)
+        paths = {os.path.abspath(path) for path in changed}
+        if not paths:
+            return
+        self.dirty = True
+        self._change_seq += 1
+        self.delta.update(paths)
 
     def apply_changes(self, paths: Iterable[str] = ()) -> bool:
         """Fold *paths* and every pending delta into the installed snapshot.
@@ -221,6 +227,10 @@ class WorkspacePathIndex:
             return False
 
         if not removals and not additions:
+            if self.dirty and not pending:
+                # Stale with nothing pending to fold: only a rescan can prove the
+                # snapshot current, so do not report it clean.
+                return False
             self.dirty = False
             self.delta.clear()
             return True
@@ -267,6 +277,10 @@ class WorkspacePathIndex:
     async def _rebuild(self, scan: ScanProjectPaths) -> bool:
         epoch = self.epoch
         change_seq = self._change_seq
+        # Everything recorded before the scan starts is in its result; only what
+        # arrives while it runs has to survive the install.
+        covered_delta = set(self.delta)
+        covered_unknown = self._unknown_changes
         try:
             result = await scan(self.root)
             index = await asyncio.to_thread(ProjectPathIndex.build, result)
@@ -278,8 +292,14 @@ class WorkspacePathIndex:
             return False
         if self.epoch != epoch:
             return False
+        arrived_delta = set(self.delta) - covered_delta
+        arrived_unknown = self._unknown_changes and not covered_unknown
         self._install(result, index)
         if self._change_seq != change_seq:
+            # The scan may predate these changes, so the snapshot is not their
+            # clean baseline: keep them pending for the next fold or rescan.
+            self.delta.update(arrived_delta)
+            self._unknown_changes = arrived_unknown
             self.dirty = True
         return True
 

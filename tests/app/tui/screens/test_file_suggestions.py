@@ -939,3 +939,59 @@ async def test_a_read_only_turn_needs_no_rebuild(
     assert handler._file_index is not None
     assert handler._file_index.dirty is False
     assert _file_rows(handler) == ["before.py"]
+
+
+async def test_a_turn_end_that_lands_during_a_rebuild_still_reaches_the_next_at(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A create recorded while a rebuild is in flight must survive that rebuild.
+
+    Installing the scan as a clean baseline would drop the create: the next turn
+    folds nothing, reports the snapshot current, and the file never shows up.
+    """
+    root = str(tmp_path)
+    created = tmp_path / "src" / "created.py"
+    created.parent.mkdir(parents=True, exist_ok=True)
+    created.write_text("", encoding="utf-8")
+    screen = _screen_at(root)
+    handler = make_suggestion_handler(screen)
+    scans: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_scan(scan_root: str) -> ProjectPathScanResult:
+        scans.append(scan_root)
+        if len(scans) == 1:
+            started.set()
+            await release.wait()
+        return scan_result(scan_root, [ProjectPathSuggestion(path="src/old.py", kind="file")])
+
+    _patch_scan(monkeypatch, gated_scan)
+    _install_file_rows(handler, root, [ProjectPathSuggestion(path="src/old.py", kind="file")])
+    assert handler._file_index is not None
+
+    # Turn 1: an unknowable change set starts a background rebuild.
+    screen.services.engine_provider = _no_engine
+    handler.mark_file_index_dirty()
+    await started.wait()
+
+    # Turn 2 lands while that rebuild is still scanning; its create is tracked.
+    screen.services.engine_provider = lambda: _engine(
+        mutated=[(MutationSource.WRITE_FILE, MutationProvenance.PROVEN)],
+        changed=[str(created)],
+    )
+    handler.mark_file_index_dirty()
+    assert handler._file_index.delta, "the create must stay pending across the rebuild"
+
+    release.set()
+    await handler._file_rebuild_worker.wait()
+    scans_after_rebuild = list(scans)
+
+    # Turn 3 changed nothing but still settles the pending create — without a scan.
+    screen.services.engine_provider = _engine
+    handler.mark_file_index_dirty()
+
+    assert scans == scans_after_rebuild == [root]
+    assert handler._file_index.dirty is False
+    assert "src/created.py" in _file_rows(handler)
