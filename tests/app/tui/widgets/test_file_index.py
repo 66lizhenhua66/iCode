@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 
 import pytest
 
@@ -586,6 +587,54 @@ class TestWorkspacePathIndexIncrementalApply:
         assert "src/first.py" in paths
         assert "src/second.py" in paths
         assert index.dirty is False
+
+    async def test_a_change_recorded_during_a_fold_is_not_published_as_covered(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """INV-2: a change that lands while the rows are derived must stay pending.
+
+        The bundle is derived from the copies taken before ``late.py`` existed,
+        so publishing it would clear the delta and report the snapshot current:
+        the path would never appear and nothing would ever retry it.  The guard
+        drops that bundle and the next fold picks the path up.
+        """
+        root = str(tmp_path)
+        (tmp_path / "src").mkdir()
+        early = tmp_path / "src" / "early.py"
+        early.write_text("", encoding="utf-8")
+        late = tmp_path / "src" / "late.py"
+        index = WorkspacePathIndex(root)
+        index.install(_scan(root, ["src/a.py"]))
+
+        fold_started = threading.Event()
+        release_fold = threading.Event()
+        derive_fold = WorkspacePathIndex._derive_fold
+
+        def gated_derive(self, removals, additions):
+            fold_started.set()
+            release_fold.wait(timeout=10)
+            return derive_fold(self, removals, additions)
+
+        monkeypatch.setattr(WorkspacePathIndex, "_derive_fold", gated_derive)
+
+        index.mark_dirty([str(early)])
+        fold = asyncio.ensure_future(index.apply_changes())
+        assert await asyncio.to_thread(fold_started.wait, 5) is True
+
+        late.write_text("", encoding="utf-8")
+        index.mark_dirty([str(late)])
+        release_fold.set()
+
+        assert await fold is False
+        assert index.dirty is True
+        assert index.delta == {os.path.abspath(str(early)), os.path.abspath(str(late))}
+        assert "src/late.py" not in _paths(index.query("", limit=10))
+
+        assert await index.apply_changes() is True
+        assert index.dirty is False
+        assert "src/late.py" in _paths(index.query("", limit=10))
 
     async def test_apply_changes_refuses_after_an_unknown_change_set(self, tmp_path) -> None:
         """An unenumerable change set can only be covered by a rescan."""
