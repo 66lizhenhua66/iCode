@@ -314,13 +314,13 @@ class TestWorkspacePathIndexLifecycle:
 
         rebuild = asyncio.ensure_future(index.refresh(slow_scan))
         await started.wait()
-        assert index.apply_changes([str(created)]) is False
+        assert await index.apply_changes([str(created)]) is False
         index.mark_dirty([str(created)])
         release.set()
         assert await rebuild is True
 
         # A later turn that changed nothing still folds what was left pending.
-        assert index.apply_changes() is True
+        assert await index.apply_changes() is True
 
         assert index.dirty is False
         assert "b.py" in _paths(index.query("", limit=10))
@@ -359,7 +359,7 @@ class TestWorkspacePathIndexLifecycle:
         assert await rebuild is True
         assert index.dirty is True
         # The enumerable delta must not be folded over a scan that never covered turn 2.
-        assert index.apply_changes([str(new)]) is False
+        assert await index.apply_changes([str(new)]) is False
         assert index.dirty is True
 
         async def rescan(scan_root: str) -> ProjectPathScanResult:
@@ -369,14 +369,14 @@ class TestWorkspacePathIndexLifecycle:
         assert index.dirty is False
         assert _paths(index.head(limit=10)) == ["new.py"]
 
-    def test_apply_changes_refuses_when_stale_with_nothing_pending(self, tmp_path) -> None:
+    async def test_apply_changes_refuses_when_stale_with_nothing_pending(self, tmp_path) -> None:
         """A stale snapshot with no known delta can only be cleared by a rescan."""
         root = str(tmp_path)
         index = WorkspacePathIndex(root)
         index.install(_scan(root, ["a.py"]))
         index.dirty = True
 
-        assert index.apply_changes() is False
+        assert await index.apply_changes() is False
         assert index.dirty is True
 
     def test_mark_dirty_with_no_changed_paths_records_nothing(self) -> None:
@@ -391,7 +391,7 @@ class TestWorkspacePathIndexLifecycle:
 
 
 class TestWorkspacePathIndexIncrementalApply:
-    def test_apply_changes_adds_and_removes_files_with_their_directory_rows(self, tmp_path) -> None:
+    async def test_apply_changes_adds_and_removes_files_with_their_directory_rows(self, tmp_path) -> None:
         root = str(tmp_path)
         (tmp_path / "src").mkdir()
         new_file = tmp_path / "src" / "b.py"
@@ -399,7 +399,7 @@ class TestWorkspacePathIndexIncrementalApply:
         index = WorkspacePathIndex(root)
         index.install(_scan(root, ["src/a.py"]))
 
-        assert index.apply_changes([str(new_file)]) is True
+        assert await index.apply_changes([str(new_file)]) is True
 
         assert _paths(index.query("b", limit=5)) == ["src/b.py"]
         assert index.snapshot is not None
@@ -408,12 +408,12 @@ class TestWorkspacePathIndexIncrementalApply:
 
         new_file.unlink()
 
-        assert index.apply_changes([str(new_file)]) is True
+        assert await index.apply_changes([str(new_file)]) is True
         assert index.query("b") == []
         assert index.snapshot is not None
         assert index.snapshot.file_count == 1
 
-    def test_apply_changes_appends_an_addition_instead_of_inserting_it_in_path_order(
+    async def test_apply_changes_appends_an_addition_instead_of_inserting_it_in_path_order(
         self,
         tmp_path,
     ) -> None:
@@ -430,11 +430,11 @@ class TestWorkspacePathIndexIncrementalApply:
         index = WorkspacePathIndex(root)
         index.install(_scan(root, ["src/zzz.py"]))
 
-        assert index.apply_changes([str(added)]) is True
+        assert await index.apply_changes([str(added)]) is True
 
         assert _paths(index.query("", limit=10)) == ["src/", "src/zzz.py", "src/aaa.py"]
 
-    def test_apply_changes_drops_a_directory_row_with_its_last_file(self, tmp_path) -> None:
+    async def test_apply_changes_drops_a_directory_row_with_its_last_file(self, tmp_path) -> None:
         root = str(tmp_path)
         nested = tmp_path / "src" / "deep"
         nested.mkdir(parents=True)
@@ -445,10 +445,10 @@ class TestWorkspacePathIndexIncrementalApply:
 
         only.unlink()
 
-        assert index.apply_changes([str(only)]) is True
+        assert await index.apply_changes([str(only)]) is True
         assert _paths(index.query("", limit=10)) == []
 
-    def test_apply_changes_keeps_a_directory_row_while_another_file_references_it(self, tmp_path) -> None:
+    async def test_apply_changes_keeps_a_directory_row_while_another_file_references_it(self, tmp_path) -> None:
         root = str(tmp_path)
         (tmp_path / "src").mkdir()
         removed = tmp_path / "src" / "a.py"
@@ -458,7 +458,7 @@ class TestWorkspacePathIndexIncrementalApply:
 
         removed.unlink()
 
-        assert index.apply_changes([str(removed)]) is True
+        assert await index.apply_changes([str(removed)]) is True
         assert _paths(index.query("", limit=10)) == ["src/", "src/b.py"]
 
     @pytest.mark.parametrize(
@@ -470,7 +470,7 @@ class TestWorkspacePathIndexIncrementalApply:
         ],
         ids=["dot-directory", "noise-top-level", "referenceable-extension-unknown"],
     )
-    def test_apply_changes_refuses_additions_whose_visibility_needs_git(self, tmp_path, relative: str) -> None:
+    async def test_apply_changes_refuses_additions_whose_visibility_needs_git(self, tmp_path, relative: str) -> None:
         """Dot entries, noise top-levels and blacklisted extensions are listed only when git says so."""
         root = str(tmp_path)
         target = tmp_path / relative
@@ -479,20 +479,20 @@ class TestWorkspacePathIndexIncrementalApply:
         index = WorkspacePathIndex(root)
         index.install(_scan(root, ["src/a.py"]))
 
-        assert index.apply_changes([str(target)]) is False
+        assert await index.apply_changes([str(target)]) is False
         assert index.query("logo") == []
         assert index.query("ci.yml") == []
 
-    def test_apply_changes_refuses_a_truncated_snapshot(self, tmp_path) -> None:
+    async def test_apply_changes_refuses_a_truncated_snapshot(self, tmp_path) -> None:
         root = str(tmp_path)
         added = tmp_path / "b.py"
         added.write_text("", encoding="utf-8")
         index = WorkspacePathIndex(root)
         index.install(_scan(root, ["a.py"], truncated=True, source_truncations={"rg": True}))
 
-        assert index.apply_changes([str(added)]) is False
+        assert await index.apply_changes([str(added)]) is False
 
-    def test_apply_changes_ignores_paths_outside_the_root(self, tmp_path) -> None:
+    async def test_apply_changes_ignores_paths_outside_the_root(self, tmp_path) -> None:
         root = str(tmp_path / "repo")
         os.makedirs(root)
         outside = tmp_path / "elsewhere.py"
@@ -500,17 +500,17 @@ class TestWorkspacePathIndexIncrementalApply:
         index = WorkspacePathIndex(root)
         index.install(_scan(root, ["a.py"]))
 
-        assert index.apply_changes([str(outside)]) is True
+        assert await index.apply_changes([str(outside)]) is True
         assert _paths(index.query("", limit=10)) == ["a.py"]
 
-    def test_apply_changes_does_not_double_list_a_known_file(self, tmp_path) -> None:
+    async def test_apply_changes_does_not_double_list_a_known_file(self, tmp_path) -> None:
         root = str(tmp_path)
         known = tmp_path / "a.py"
         known.write_text("", encoding="utf-8")
         index = WorkspacePathIndex(root)
         index.install(_scan(root, ["a.py"]))
 
-        assert index.apply_changes([str(known)]) is True
+        assert await index.apply_changes([str(known)]) is True
         assert _paths(index.query("", limit=10)) == ["a.py"]
 
     async def test_apply_changes_refuses_while_a_rebuild_is_in_flight(self, tmp_path) -> None:
@@ -522,11 +522,11 @@ class TestWorkspacePathIndexIncrementalApply:
         index.build_task = asyncio.create_task(asyncio.sleep(3600))
 
         try:
-            assert index.apply_changes([str(added)]) is False
+            assert await index.apply_changes([str(added)]) is False
         finally:
             index.build_task.cancel()
 
-    def test_discard_drops_the_snapshot_and_its_bookkeeping(self, tmp_path) -> None:
+    async def test_discard_drops_the_snapshot_and_its_bookkeeping(self, tmp_path) -> None:
         root = str(tmp_path)
         added = tmp_path / "b.py"
         added.write_text("", encoding="utf-8")
@@ -540,9 +540,9 @@ class TestWorkspacePathIndexIncrementalApply:
         assert index.dirty is False
         assert index.epoch == epoch + 1
         assert index.query("a") == []
-        assert index.apply_changes([str(added)]) is False
+        assert await index.apply_changes([str(added)]) is False
 
-    def test_apply_changes_folds_a_pending_delta_from_an_earlier_failed_batch(self, tmp_path) -> None:
+    async def test_apply_changes_folds_a_pending_delta_from_an_earlier_failed_batch(self, tmp_path) -> None:
         """A change that could not be folded earlier is not lost by the next batch."""
         root = str(tmp_path)
         first = tmp_path / "src" / "first.py"
@@ -556,7 +556,7 @@ class TestWorkspacePathIndexIncrementalApply:
         blocked = tmp_path / "dist" / "bundle.js"
         blocked.parent.mkdir(parents=True, exist_ok=True)
         blocked.write_text("", encoding="utf-8")
-        assert index.apply_changes([str(first), str(blocked)]) is False
+        assert await index.apply_changes([str(first), str(blocked)]) is False
         index.mark_dirty([str(first), str(blocked)])
 
         # The retry batch carries only the new path, yet the earlier one is still
@@ -564,7 +564,7 @@ class TestWorkspacePathIndexIncrementalApply:
         pending = set(index.delta)
         assert str(first) in {os.path.abspath(path) for path in pending}
 
-    def test_apply_changes_folds_every_pending_path_on_retry(self, tmp_path) -> None:
+    async def test_apply_changes_folds_every_pending_path_on_retry(self, tmp_path) -> None:
         root = str(tmp_path)
         first = tmp_path / "src" / "first.py"
         second = tmp_path / "src" / "second.py"
@@ -576,18 +576,18 @@ class TestWorkspacePathIndexIncrementalApply:
         blocked = tmp_path / "dist" / "bundle.js"
         blocked.parent.mkdir(parents=True, exist_ok=True)
         blocked.write_text("", encoding="utf-8")
-        assert index.apply_changes([str(first), str(blocked)]) is False
+        assert await index.apply_changes([str(first), str(blocked)]) is False
         index.mark_dirty([str(first), str(blocked)])
         blocked.unlink()
 
-        assert index.apply_changes([str(second)]) is True
+        assert await index.apply_changes([str(second)]) is True
 
         paths = _paths(index.query("", limit=10))
         assert "src/first.py" in paths
         assert "src/second.py" in paths
         assert index.dirty is False
 
-    def test_apply_changes_refuses_after_an_unknown_change_set(self, tmp_path) -> None:
+    async def test_apply_changes_refuses_after_an_unknown_change_set(self, tmp_path) -> None:
         """An unenumerable change set can only be covered by a rescan."""
         root = str(tmp_path)
         added = tmp_path / "b.py"
@@ -596,9 +596,9 @@ class TestWorkspacePathIndexIncrementalApply:
         index.install(_scan(root, ["a.py"]))
         index.mark_dirty()
 
-        assert index.apply_changes([str(added)]) is False
+        assert await index.apply_changes([str(added)]) is False
 
-    def test_a_rescan_clears_the_unknown_change_set(self, tmp_path) -> None:
+    async def test_a_rescan_clears_the_unknown_change_set(self, tmp_path) -> None:
         root = str(tmp_path)
         added = tmp_path / "b.py"
         added.write_text("", encoding="utf-8")
@@ -607,10 +607,10 @@ class TestWorkspacePathIndexIncrementalApply:
         index.mark_dirty()
         index.install(_scan(root, ["a.py"]))
 
-        assert index.apply_changes([str(added)]) is True
+        assert await index.apply_changes([str(added)]) is True
 
     @pytest.mark.skipif(os.name != "nt", reason="path identity is case-insensitive only on Windows")
-    def test_apply_changes_does_not_list_a_case_variant_of_a_known_file(self, tmp_path) -> None:
+    async def test_apply_changes_does_not_list_a_case_variant_of_a_known_file(self, tmp_path) -> None:
         """Windows is case-insensitive: ``src/App.py`` is the row ``src/app.py``.
 
         Folding by the literal relative path appended a second row for one file,
@@ -622,6 +622,6 @@ class TestWorkspacePathIndexIncrementalApply:
         index = WorkspacePathIndex(str(tmp_path))
         index.install(_scan(str(tmp_path), ["src/app.py"]))
 
-        assert index.apply_changes([str(tmp_path / "src" / "App.py")]) is True
+        assert await index.apply_changes([str(tmp_path / "src" / "App.py")]) is True
 
         assert _paths(index.head(limit=10)) == ["src/", "src/app.py"]

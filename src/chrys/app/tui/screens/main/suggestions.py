@@ -826,20 +826,22 @@ class SuggestionHandler:
     def mark_file_index_dirty(self) -> None:
         """Mark the ``@`` snapshot stale when an agent turn ends.
 
-        The popup keeps answering from the snapshot; the rebuild runs in the
-        background and hot-swaps the snapshot only once it succeeded, so a turn
-        that changed files costs the next ``@`` nothing.
+        ADR-3b: the turn end no longer folds anything here — it records the
+        change and queues the lifecycle worker, which folds in memory off the
+        event loop and only upgrades to a scan when the change set cannot be
+        folded.  The popup keeps answering from the installed snapshot in the
+        meantime, so a turn that changed files costs the next ``@`` nothing.
         """
         index = self._file_index
         if index is None or not index.installed:
             return
         changed = self._turn_changed_paths()
-        if changed is not None and index.apply_changes(changed):
-            # A turn that only read files (empty set) also lands here: nothing to rebuild.
+        if changed is not None and not changed and not index.dirty:
+            # A turn that only read files, on a snapshot nothing left pending:
+            # there is no work, so do not even queue a worker.
             return
         index.mark_dirty(changed)
-        if index.dirty:
-            self._schedule_file_index_rebuild(index)
+        self._schedule_file_index_rebuild(index)
 
     def invalidate_file_index(self) -> None:
         """Force a rescan after a rollback restored files behind the tracker's back.
@@ -885,7 +887,12 @@ class SuggestionHandler:
         return tracker.get_changed_files_set()
 
     def _schedule_file_index_rebuild(self, index: WorkspacePathIndex) -> None:
-        """Rebuild a stale snapshot off the input path."""
+        """Queue the lifecycle worker that settles a stale snapshot, off the input path.
+
+        Single-flight: a request that lands while the worker runs is converged by
+        it — the worker folds first and only scans when it cannot fold — so no
+        second worker is started.
+        """
         if not self._view.is_attached:
             return
         worker = self._file_rebuild_worker
@@ -898,24 +905,36 @@ class SuggestionHandler:
         )
 
     async def _run_file_index_rebuild(self, index: WorkspacePathIndex) -> None:
-        """Rebuild until the snapshot is provably current, within a bounded number of scans.
+        """Settle the snapshot: fold in memory first, scan only when it cannot fold.
 
-        A change that landed mid-scan leaves the installed snapshot dirty: an
-        enumerable one folds in memory right here, an unknowable one forces one
+        ADR-3b: ``mark_file_index_dirty()`` only accepts the change; this worker
+        is where it lands.  The fold derives off the event loop and publishes by
+        reference, so the popup keeps answering from the old snapshot while it
+        runs.  A change that landed mid-scan leaves the installed snapshot dirty:
+        an enumerable one folds on the next pass, an unknowable one forces one
         more scan.  The cap keeps a workspace that changes faster than it can be
         scanned from re-scanning forever; whatever is still pending stays dirty
         for the next lifecycle event.
         """
         for _attempt in range(_FILE_INDEX_REBUILD_SCANS):
+            settled = await index.apply_changes()
+            if self._file_index is not index:
+                return
+            if settled:
+                self._refresh_file_suggestions_if_shown()
+                return
             if not await index.refresh():
                 return
             if self._file_index is not index:
                 return
-            settled = index.apply_changes()
-            if self._suggestion_mode == "files":
-                self._show_latest_file_query_or_head()
-            if settled or not index.dirty:
+            self._refresh_file_suggestions_if_shown()
+            if not index.dirty:
                 return
+
+    def _refresh_file_suggestions_if_shown(self) -> None:
+        """Re-render the ``@`` popup after the snapshot was replaced."""
+        if self._suggestion_mode == "files":
+            self._show_latest_file_query_or_head()
 
     async def _run_file_warmup_loop(self) -> None:
         """Coalesced cold build; a root that already has a snapshot never lands here."""

@@ -858,11 +858,108 @@ async def test_a_turn_end_applies_tracker_deltas_without_a_rebuild(
 
     handler.mark_file_index_dirty()
 
-    assert handler._file_rebuild_worker is None
+    # ADR-3b: the turn end only accepts the change; the fold lands in the worker.
+    worker = handler._file_rebuild_worker
+    assert worker is not None
+    await worker.wait()
+
     assert handler._file_index is not None
     assert handler._file_index.dirty is False
     # ADR-3a: a folded row is appended, so only the visible set is contractual here.
     assert set(_file_rows(handler)) == {"src/", "src/old.py", "src/new.py"}
+
+
+async def test_a_pending_fold_reports_dirty_until_the_worker_publishes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """ADR-3b: between accepting the change and installing it, ``@`` answers stale.
+
+    The turn end returns before the fold is derived, so the window is the only
+    place the old snapshot could be reported current; nothing scans in it, and
+    the worker publishes the delta without a subprocess.
+    """
+    root = str(tmp_path)
+    created = tmp_path / "src" / "new.py"
+    created.parent.mkdir(parents=True, exist_ok=True)
+    created.write_text("", encoding="utf-8")
+    screen = _screen_at(root)
+    handler = make_suggestion_handler(screen)
+
+    async def unexpected_scan(scan_root: str) -> ProjectPathScanResult:
+        raise AssertionError("a foldable turn end must not scan")
+
+    _patch_scan(monkeypatch, unexpected_scan)
+    _install_file_rows(handler, root, [ProjectPathSuggestion(path="src/old.py", kind="file")])
+    screen.services.engine_provider = lambda: _engine(
+        mutated=[(MutationSource.WRITE_FILE, MutationProvenance.PROVEN)],
+        changed=[str(created)],
+    )
+
+    handler.mark_file_index_dirty()
+    worker = handler._file_rebuild_worker
+    index = handler._file_index
+    assert worker is not None
+    assert index is not None
+    assert index.dirty is True
+    assert _file_rows(handler) == ["src/old.py"]
+
+    await worker.wait()
+
+    assert index.dirty is False
+    assert set(_file_rows(handler)) == {"src/", "src/old.py", "src/new.py"}
+
+
+async def test_a_discard_during_a_pending_fold_drops_the_publish(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """INV-2: a fold that straddles a workspace switch must not publish.
+
+    ``discard()`` bumps the epoch, so the derived rows are dropped: the snapshot
+    stays empty instead of being resurrected from the root that was left behind,
+    and the dropped fold does not fall back to scanning.
+    """
+    root = str(tmp_path)
+    created = tmp_path / "new.py"
+    created.write_text("", encoding="utf-8")
+    screen = _screen_at(root)
+    handler = make_suggestion_handler(screen)
+
+    async def unexpected_scan(scan_root: str) -> ProjectPathScanResult:
+        raise AssertionError("a fold that lost its epoch must not fall back to a scan")
+
+    _patch_scan(monkeypatch, unexpected_scan)
+    index = _install_file_rows(handler, root, [ProjectPathSuggestion(path="old.py", kind="file")])
+    screen.services.engine_provider = lambda: _engine(
+        mutated=[(MutationSource.WRITE_FILE, MutationProvenance.PROVEN)],
+        changed=[str(created)],
+    )
+
+    fold_started = threading.Event()
+    release_fold = threading.Event()
+    derive_fold = WorkspacePathIndex._derive_fold
+
+    def gated_derive(self, removals, additions):
+        fold_started.set()
+        release_fold.wait(timeout=10)
+        return derive_fold(self, removals, additions)
+
+    monkeypatch.setattr(WorkspacePathIndex, "_derive_fold", gated_derive)
+
+    handler.mark_file_index_dirty()
+    worker = handler._file_rebuild_worker
+    assert worker is not None
+    assert await asyncio.to_thread(fold_started.wait, 5) is True
+
+    handler.discard_file_index()
+    release_fold.set()
+    await worker.wait()
+
+    assert index.snapshot is None
+    assert index.installed is False
+    assert index.query("old") == []
+    assert index.delta == set()
 
 
 @pytest.mark.parametrize(
@@ -989,9 +1086,11 @@ async def test_a_turn_end_that_lands_during_a_rebuild_still_reaches_the_next_at(
     await handler._file_rebuild_worker.wait()
     scans_after_rebuild = list(scans)
 
-    # Turn 3 changed nothing but still settles the pending create — without a scan.
+    # Turn 3 changed nothing and left nothing pending: the worker that settled the
+    # create is reused, and settling it still costs no scan.
     screen.services.engine_provider = _engine
     handler.mark_file_index_dirty()
+    await handler._file_rebuild_worker.wait()
 
     assert scans == scans_after_rebuild == [root]
     assert handler._file_index.dirty is False

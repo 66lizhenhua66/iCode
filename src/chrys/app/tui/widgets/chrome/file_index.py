@@ -7,8 +7,10 @@ query returns a bounded top-k result with the same ordering semantics as
 ``fuzzy_filter``: match position, original path length, then original path text.
 
 ``WorkspacePathIndex`` owns that snapshot's lifecycle for one root: the ``@``
-popup answers every keystroke from the installed snapshot, while rebuilds run
-off the input path and only hot-swap the snapshot once they finish.
+popup answers every keystroke from the installed snapshot, while incremental
+folds and full rebuilds both derive off the event loop and only publish a
+finished result (ADR-3b).  ``dirty`` therefore means "the snapshot may be behind
+the filesystem", never "block the popup until it is current".
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import os
 import sys
 from bisect import bisect_left
 from collections.abc import Awaitable, Callable, Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from chrys.app.tui.widgets.chrome.file_scanner import (
     ProjectPathScanResult,
@@ -125,6 +127,95 @@ def _directory_reference_counts(files: Iterable[str]) -> dict[str, int]:
     return counts
 
 
+def _materialize_rows(files: Iterable[str], directory_counts: dict[str, int]) -> list[ProjectPathSuggestion]:
+    """Return file rows plus one row per live directory, in insertion order."""
+    rows: list[ProjectPathSuggestion] = []
+    emitted: set[str] = set()
+    for relative_path in files:
+        for directory in _ancestor_directories(relative_path):
+            if directory in emitted or directory_counts.get(directory, 0) <= 0:
+                continue
+            emitted.add(directory)
+            rows.append(ProjectPathSuggestion(path=directory, kind="directory"))
+        rows.append(ProjectPathSuggestion(path=relative_path, kind="file"))
+    return rows
+
+
+def _append_file(
+    files: list[str],
+    identities: dict[str, str],
+    directory_counts: dict[str, int],
+    relative_path: str,
+) -> None:
+    """Append a folded file row; never inserted in path order.
+
+    ADR-3a: ``head()`` returns a prefix of the last full scan's order, not a
+    lexicographic prefix — ``rg --sort path`` is a per-directory depth-first
+    order and the supplemental sources append after the primary block.  A
+    folded row therefore goes to the tail of ``files`` (its ancestor rows stay
+    next to it), so post-fold empty-query order is not guaranteed to match a
+    fresh full scan until the next full rebuild.  Frozen regardless: the visible
+    set, the match ordering key, the ``source_truncations`` key set, and the
+    budget constants.  Do not turn this into a sorted insert.
+    """
+    files.append(relative_path)
+    identities[_path_identity(relative_path)] = relative_path
+    for directory in _ancestor_directories(relative_path):
+        directory_counts[directory] = directory_counts.get(directory, 0) + 1
+
+
+def _drop_file(
+    files: list[str],
+    identities: dict[str, str],
+    directory_counts: dict[str, int],
+    identity: str,
+) -> None:
+    """Drop a folded file row and the directory references it held."""
+    relative_path = identities.pop(identity, None)
+    if relative_path is None:
+        return
+    with contextlib.suppress(ValueError):
+        files.remove(relative_path)
+    for directory in _ancestor_directories(relative_path):
+        remaining = directory_counts.get(directory, 0) - 1
+        if remaining > 0:
+            directory_counts[directory] = remaining
+        else:
+            directory_counts.pop(directory, None)
+
+
+class _InstallBundle(NamedTuple):
+    """Everything one install needs, derived off the event loop (ADR-3b).
+
+    Publishing this is reference assignment only: no list or dict derivation, no
+    path normalization and no ``os.path`` batch run happen on the event loop.
+    """
+
+    files: list[str]
+    identities: dict[str, str]
+    directory_counts: dict[str, int]
+    snapshot: ProjectPathIndex
+    source_truncations: dict[str, bool]
+    file_budget: int
+    suggestion_budget: int
+    ordering: ProjectPathOrdering
+
+
+def _derive_from_scan(scan: ProjectPathScanResult) -> _InstallBundle:
+    """Derive a scan's snapshot and bookkeeping — the thread half of an install (ADR-3b)."""
+    files = [suggestion.path for suggestion in scan.paths if suggestion.kind == "file"]
+    return _InstallBundle(
+        files=files,
+        identities={_path_identity(relative_path): relative_path for relative_path in files},
+        directory_counts=_directory_reference_counts(files),
+        snapshot=ProjectPathIndex.build(scan),
+        source_truncations=dict(scan.source_truncations),
+        file_budget=scan.file_budget,
+        suggestion_budget=scan.suggestion_budget,
+        ordering=scan.ordering,
+    )
+
+
 class WorkspacePathIndex:
     """Resident ``@`` path snapshot for one workspace root.
 
@@ -183,7 +274,7 @@ class WorkspacePathIndex:
 
     def install(self, scan: ProjectPathScanResult) -> None:
         """Install *scan* as the snapshot of this root."""
-        self._install(scan, ProjectPathIndex.build(scan))
+        self._install(scan)
 
     def mark_dirty(self, changed: Iterable[str] | None = None) -> None:
         """Record that the snapshot may be stale.
@@ -206,8 +297,16 @@ class WorkspacePathIndex:
         self._change_seq += 1
         self.delta.update(paths)
 
-    def apply_changes(self, paths: Iterable[str] = ()) -> bool:
-        """Fold *paths* and every pending delta into the installed snapshot.
+    async def apply_changes(self, paths: Iterable[str] = ()) -> bool:
+        """Fold *paths* and every pending delta into the installed snapshot, off the event loop.
+
+        ADR-3b: the derive runs in a worker thread and the event loop only
+        publishes the result by reference assignment, so ``True`` means "derived
+        and published" rather than "finished synchronously".  A caller that
+        awaits this sees the same state the old synchronous fold left behind;
+        what changed is that :meth:`mark_dirty` alone no longer guarantees an
+        installed result.  While the fold is in flight ``dirty`` stays ``True``
+        and queries keep answering from the old snapshot.
 
         Nothing is written until the whole batch is known to be representable, so
         a pending delta from an earlier failed batch is folded with this one
@@ -215,8 +314,9 @@ class WorkspacePathIndex:
 
         Returns ``False`` when this root cannot be kept correct in memory — no
         snapshot, a truncated scan, an unenumerable change set, a rebuild already
-        in flight, a directory, or a path whose visibility needs git evidence —
-        so the caller upgrades to a full rebuild instead of guessing.
+        in flight, a directory, a path whose visibility needs git evidence, a
+        file-budget overrun, or an ``epoch``/``_change_seq`` that moved while
+        deriving — so the caller upgrades to a full rebuild instead of guessing.
         """
         snapshot = self.snapshot
         if snapshot is None or snapshot.truncated or self._unknown_changes or self._building():
@@ -224,6 +324,10 @@ class WorkspacePathIndex:
 
         pending = set(self.delta)
         pending.update(os.path.abspath(path) for path in paths)
+        if not pending:
+            # Stale with nothing pending to fold: only a rescan can prove the
+            # snapshot current, so do not report it clean.
+            return not self.dirty
 
         removals: list[str] = []
         additions: list[str] = []
@@ -248,19 +352,20 @@ class WorkspacePathIndex:
             return False
 
         if not removals and not additions:
-            if self.dirty and not pending:
-                # Stale with nothing pending to fold: only a rescan can prove the
-                # snapshot current, so do not report it clean.
-                return False
+            # Nothing representable changed, so this batch leaves the snapshot current.
             self.dirty = False
             self.delta.clear()
             return True
 
-        for identity in removals:
-            self._remove_file(identity)
-        for relative in additions:
-            self._add_file(relative)
-        self._reinstall_rows()
+        epoch = self.epoch
+        change_seq = self._change_seq
+        bundle = await asyncio.to_thread(self._derive_fold, removals, additions)
+        if self.epoch != epoch or self._change_seq != change_seq:
+            # A rebuild installed, or a change landed while deriving: this bundle
+            # does not cover the current state, so leave it pending for the next
+            # fold or rescan instead of publishing a stale answer as current.
+            return False
+        self._publish(bundle)
         return True
 
     def discard(self) -> None:
@@ -307,7 +412,7 @@ class WorkspacePathIndex:
         covered_unknown_seq = self._unknown_seq
         try:
             result = await scan(self.root)
-            index = await asyncio.to_thread(ProjectPathIndex.build, result)
+            bundle = await asyncio.to_thread(_derive_from_scan, result)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -318,7 +423,7 @@ class WorkspacePathIndex:
             return False
         arrived_delta = set(self.delta) - covered_delta
         arrived_unknown = self._unknown_seq != covered_unknown_seq
-        self._install(result, index)
+        self._publish(bundle)
         if self._change_seq != change_seq:
             # The scan may predate these changes, so the snapshot is not their
             # clean baseline: keep them pending for the next fold or rescan.
@@ -327,23 +432,34 @@ class WorkspacePathIndex:
             self.dirty = True
         return True
 
-    def _install(self, scan: ProjectPathScanResult, index: ProjectPathIndex) -> None:
-        self.snapshot = index
-        self.epoch += 1
-        self._files = [suggestion.path for suggestion in scan.paths if suggestion.kind == "file"]
-        self._identities = {_path_identity(relative_path): relative_path for relative_path in self._files}
-        self._directory_counts = _directory_reference_counts(self._files)
-        self._source_truncations = dict(scan.source_truncations)
-        self._file_budget = scan.file_budget
-        self._suggestion_budget = scan.suggestion_budget
-        self._ordering = scan.ordering
-        self.delta.clear()
-        self._unknown_changes = False
-        self.dirty = False
+    def _install(self, scan: ProjectPathScanResult) -> None:
+        """Install a scan result on the calling thread.
 
-    def _reinstall_rows(self) -> None:
-        """Re-materialize the snapshot from the maintained file list."""
-        rows = self._materialize_rows()
+        ADR-3b: production derives a scan's bookkeeping in a worker thread
+        (:meth:`_rebuild`) and only publishes it here.  This synchronous form
+        serves callers that already hold a scan, and must not grow derivation the
+        event loop would otherwise repeat.
+        """
+        self._publish(_derive_from_scan(scan))
+
+    def _derive_fold(self, removals: list[str], additions: list[str]) -> _InstallBundle:
+        """Derive the folded rows on private copies — the thread half of a fold.
+
+        ADR-3b: a fold costs time proportional to the installed rows, not to the
+        number of changed files, so it runs here, off the event loop, on copies
+        of ``_files``, ``_identities`` and ``_directory_counts``.  The loop only
+        publishes the returned bundle, so a large workspace no longer blocks
+        input while its rows are re-derived.
+        """
+        files = list(self._files)
+        identities = dict(self._identities)
+        directory_counts = dict(self._directory_counts)
+        for identity in removals:
+            _drop_file(files, identities, directory_counts, identity)
+        for relative_path in additions:
+            _append_file(files, identities, directory_counts, relative_path)
+
+        rows = _materialize_rows(files, directory_counts)
         suggestions_truncated = len(rows) > self._suggestion_budget
         if suggestions_truncated:
             rows = rows[: self._suggestion_budget]
@@ -361,50 +477,37 @@ class WorkspacePathIndex:
             source_truncations=source_truncations,
             ordering=self._ordering,
         )
-        self._install(scan, ProjectPathIndex.build(scan))
+        return _InstallBundle(
+            files=files,
+            identities=identities,
+            directory_counts=directory_counts,
+            snapshot=ProjectPathIndex.build(scan),
+            source_truncations=dict(scan.source_truncations),
+            file_budget=scan.file_budget,
+            suggestion_budget=scan.suggestion_budget,
+            ordering=scan.ordering,
+        )
 
-    def _materialize_rows(self) -> list[ProjectPathSuggestion]:
-        """Return file rows plus one row per live directory, in insertion order."""
-        rows: list[ProjectPathSuggestion] = []
-        emitted: set[str] = set()
-        for relative_path in self._files:
-            for directory in _ancestor_directories(relative_path):
-                if directory in emitted or self._directory_counts.get(directory, 0) <= 0:
-                    continue
-                emitted.add(directory)
-                rows.append(ProjectPathSuggestion(path=directory, kind="directory"))
-            rows.append(ProjectPathSuggestion(path=relative_path, kind="file"))
-        return rows
+    def _publish(self, bundle: _InstallBundle) -> None:
+        """Install a derived bundle: reference assignments only.
 
-    def _add_file(self, relative_path: str) -> None:
-        """Append a folded file row; never inserted in path order.
-
-        ADR-3a: ``head()`` returns a prefix of the last full scan's order, not a
-        lexicographic prefix — ``rg --sort path`` is a per-directory depth-first
-        order and the supplemental sources append after the primary block.  A
-        folded row therefore goes to the tail of ``_files`` (its ancestor rows
-        stay next to it), so post-fold empty-query order is not guaranteed to
-        match a fresh full scan until the next full rebuild.  Frozen regardless:
-        the visible set, the match ordering key, the ``source_truncations`` key
-        set, and the budget constants.  Do not turn this into a sorted insert.
+        ADR-3b: nothing proportional to the row count may run here — everything
+        was derived in :meth:`_derive_fold` or :func:`_derive_from_scan`.  Bumping
+        :attr:`epoch` is what makes a scan or fold that started earlier drop its
+        result instead of overwriting this snapshot.
         """
-        self._files.append(relative_path)
-        self._identities[_path_identity(relative_path)] = relative_path
-        for directory in _ancestor_directories(relative_path):
-            self._directory_counts[directory] = self._directory_counts.get(directory, 0) + 1
-
-    def _remove_file(self, identity: str) -> None:
-        relative_path = self._identities.pop(identity, None)
-        if relative_path is None:
-            return
-        with contextlib.suppress(ValueError):
-            self._files.remove(relative_path)
-        for directory in _ancestor_directories(relative_path):
-            remaining = self._directory_counts.get(directory, 0) - 1
-            if remaining > 0:
-                self._directory_counts[directory] = remaining
-            else:
-                self._directory_counts.pop(directory, None)
+        self._files = bundle.files
+        self._identities = bundle.identities
+        self._directory_counts = bundle.directory_counts
+        self.snapshot = bundle.snapshot
+        self._source_truncations = bundle.source_truncations
+        self._file_budget = bundle.file_budget
+        self._suggestion_budget = bundle.suggestion_budget
+        self._ordering = bundle.ordering
+        self.epoch += 1
+        self.delta.clear()
+        self._unknown_changes = False
+        self.dirty = False
 
     def _relative_path(self, path: str) -> str | None:
         """Return *path* relative to this root in ``/`` form, or ``None`` when outside it."""
