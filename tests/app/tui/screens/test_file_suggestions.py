@@ -1097,6 +1097,123 @@ async def test_a_turn_end_that_lands_during_a_rebuild_still_reaches_the_next_at(
     assert "src/created.py" in _file_rows(handler)
 
 
+def _flat_tree_rows(root) -> list[ProjectPathSuggestion]:
+    """Return one file row per file currently in *root*, in scan order."""
+    return [ProjectPathSuggestion(path=path.name, kind="file") for path in sorted(root.iterdir()) if path.is_file()]
+
+
+async def test_a_turn_end_that_lands_during_the_cold_build_survives_the_install(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A change recorded while the first scan is in flight must not be washed clean.
+
+    The cold scan already walked the directory, so its rows predate the turn.
+    Dropping the change set installs that scan as a clean baseline: the deleted
+    file stays listed and the created one is missing until something else
+    rescans.  The delta must instead survive the install and fold in.
+    """
+    root = str(tmp_path)
+    (tmp_path / "old.py").write_text("", encoding="utf-8")
+    gone = tmp_path / "gone.py"
+    gone.write_text("", encoding="utf-8")
+    screen = _screen_at(root)
+    handler = make_suggestion_handler(screen)
+    scans: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_cold_scan(scan_root: str) -> ProjectPathScanResult:
+        scans.append(scan_root)
+        # Rows are fixed when the scan starts, before the turn below changes the tree.
+        rows = _flat_tree_rows(tmp_path)
+        started.set()
+        await release.wait()
+        return scan_result(scan_root, rows)
+
+    _patch_scan(monkeypatch, gated_cold_scan)
+    screen.services.engine_provider = _no_engine
+    handler._suggestion_mode = "files"
+    opening = asyncio.create_task(handler.show_file_suggestions_async())
+    await started.wait()
+    index = handler._file_index
+    assert index is not None
+    assert index.installed is False
+    assert index._building() is True
+
+    created = tmp_path / "new.py"
+    created.write_text("", encoding="utf-8")
+    gone.unlink()
+    screen.services.engine_provider = lambda: _engine(
+        mutated=[(MutationSource.WRITE_FILE, MutationProvenance.PROVEN)],
+        changed=[str(created), str(gone)],
+    )
+    handler.mark_file_index_dirty()
+
+    release.set()
+    await opening
+    worker = handler._file_rebuild_worker
+    assert worker is not None
+    await worker.wait()
+
+    assert index.dirty is False
+    assert set(_file_rows(handler)) == {"old.py", "new.py"}
+
+    # A scan of the very same tree must agree with what the fold installed.
+    async def current_tree_scan(scan_root: str) -> ProjectPathScanResult:
+        return scan_result(scan_root, _flat_tree_rows(tmp_path))
+
+    assert await index.refresh(current_tree_scan) is True
+    assert set(_file_rows(handler)) == {row.path for row in _flat_tree_rows(tmp_path)}
+
+
+async def test_a_rollback_invalidation_that_lands_during_the_cold_build_survives_the_install(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A rollback restoring files while the first scan is in flight must rescan.
+
+    The restored paths never reach ``mark_file_index_dirty``, so dropping the
+    invalidation installs a scan that still lists what the undo removed and
+    reports it current.
+    """
+    root = str(tmp_path)
+    generated = tmp_path / "generated.py"
+    generated.write_text("", encoding="utf-8")
+    screen = _screen_at(root)
+    handler = make_suggestion_handler(screen)
+    scans: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_cold_scan(scan_root: str) -> ProjectPathScanResult:
+        scans.append(scan_root)
+        rows = _flat_tree_rows(tmp_path)
+        if len(scans) == 1:
+            started.set()
+            await release.wait()
+        return scan_result(scan_root, rows)
+
+    _patch_scan(monkeypatch, gated_cold_scan)
+    handler._suggestion_mode = "files"
+    opening = asyncio.create_task(handler.show_file_suggestions_async())
+    await started.wait()
+
+    generated.unlink()
+    handler.invalidate_file_index()
+
+    release.set()
+    await opening
+    worker = handler._file_rebuild_worker
+    assert worker is not None
+    await worker.wait()
+
+    assert scans == [root, root]
+    assert handler._file_index is not None
+    assert handler._file_index.dirty is False
+    assert _file_rows(handler) == []
+
+
 async def test_a_rollback_invalidation_drops_the_path_the_undo_restored_away(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

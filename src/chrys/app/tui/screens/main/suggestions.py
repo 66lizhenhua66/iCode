@@ -1099,9 +1099,17 @@ class SuggestionHandler:
         event loop and only upgrades to a scan when the change set cannot be
         folded.  The popup keeps answering from the installed snapshot in the
         meantime, so a turn that changed files costs the next ``@`` nothing.
+
+        A first cold build still in flight is not a reason to drop the change
+        set: its scan may already have walked the changed directory, so the
+        delta is recorded and ``_rebuild`` keeps it pending across the install.
+        Only a root with neither a snapshot nor a build has nothing to keep
+        current — the cold build that follows reads the tree as it stands.
         """
         index = self._file_index
-        if index is None or not index.installed:
+        if index is None:
+            return
+        if not index.installed and not index._building():
             return
         changed = self._turn_changed_paths()
         if changed is not None and not changed and not index.dirty:
@@ -1120,9 +1128,15 @@ class SuggestionHandler:
         undid.  ``discard()`` would blank the popup until a cold build finishes,
         so the snapshot is marked dirty with an unknown change set instead: it
         keeps answering, and the rebuild hot-swaps the restored truth.
+
+        A cold build in flight gets the same treatment: its scan may predate the
+        restore, so the unknown change set survives the install and forces the
+        one rescan that proves the restored tree.
         """
         index = self._file_index
-        if index is None or not index.installed:
+        if index is None:
+            return
+        if not index.installed and not index._building():
             return
         index.mark_dirty()
         self._schedule_file_index_rebuild(index)
